@@ -49,16 +49,28 @@ def make_show(monkeypatch):
     monkeypatch.setattr(api, "fetch_legend", lambda layer: b"")
     monkeypatch.setattr(api, "fetch_frame", lambda layer, ts, w, h, bg, overlays=(): ts.encode())
     monkeypatch.setattr(cli.render, "load_legend", lambda data: None)
-    monkeypatch.setattr(cli.render, "compose", lambda png, legend, theme, markers=None: png)
+    monkeypatch.setattr(
+        cli.render, "compose", lambda png, legend, theme, markers=None: png + (markers or b"")
+    )
+    monkeypatch.setattr(cli.render, "marker_layer", lambda *a: b"+pins")
     monkeypatch.setattr(cli.sixel, "encode", lambda image: image)
     monkeypatch.setattr(api, "overlay_times", lambda: {})
     monkeypatch.setattr(api, "fetch_alerts", lambda overlays, bbox, ts, snapshots: ALERTS)
     monkeypatch.setattr(api, "fetch_alert_text", lambda alert: TEXTS[alert.url])
 
-    def make(keys, delay, loop=False, overlays=()):
+    def make(keys, delay, loop=False, overlays=(), markers=None):
         layer = api.Layer("kabx", "sr_bref", "", "", (0, 0, 1, 1), tuple(TIMES))
         show = cli.Slideshow(
-            None, layer, TIMES, (10, 10), "dark", delay, loop, legend=True, overlays=overlays
+            None,
+            layer,
+            TIMES,
+            (10, 10),
+            "dark",
+            delay,
+            loop,
+            legend=True,
+            overlays=overlays,
+            markers=markers,
         )
         show.term = FakeTerm(keys, show)
         shown = []
@@ -155,6 +167,38 @@ def test_messages_view_pauses_and_returns(make_show):
     rows = re.split(r"\x1b\[\d+;1H", view)[1:]
     assert len(rows) == 40
     assert all(len(cli.SGR_RE.sub("", r)) == 120 for r in rows)
+
+
+def test_l_toggles_looping(make_show):
+    show, shown = make_show(["loop"] + [None] * 15, delay=0.001)
+    show.run()
+    assert shown[:5] == [0, 1, 2, 0, 1]
+    assert "l: stop looping" in show._status_text(0, 0, False)
+
+
+def test_l_stops_looping(make_show):
+    show, shown = make_show(["loop"] + [None] * 15, delay=0.001, loop=True)
+    show.run()
+    assert shown == [0, 1, 2]
+    assert "l: loop" in show._status_text(2, 2, False)
+
+
+def test_t_toggles_markers(make_show):
+    keys = [None, "space", "markers", "right", "markers"]
+    show, shown = make_show(keys, delay=100, markers=[(5, 5, "Home")])
+    show.run()
+    assert shown == [0, 0, 1, 1]
+    images = [s for s in show.term.screens if isinstance(s, bytes) and b"2026" in s]
+    assert [b"+pins" in s for s in images] == [True, False, False, True]
+    assert "t: hide markers" in show._status_text(1, 1, False)
+
+
+def test_t_ignored_without_markers(make_show):
+    show, shown = make_show([None, "space", "markers"], delay=100)
+    show.run()
+    assert shown == [0]
+    assert show.plain == [None] * 3
+    assert "t:" not in show._status_text(0, 0, False)
 
 
 def test_fill_line():

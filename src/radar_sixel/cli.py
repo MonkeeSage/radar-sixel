@@ -122,6 +122,9 @@ class Slideshow:
         self.timed = tuple(o for o in overlays if api.OVERLAYS[o].timed)
         # Each slot holds encoded sixel bytes, the fetch error, or None (pending).
         self.frames: list[bytes | Exception | None] = [None] * len(times)
+        # The same frames without markers, filled in just before self.frames.
+        self.plain: list[bytes | Exception | None] = [None] * len(times)
+        self.show_markers = True
         # Alerts in view per frame, filled in before the frame itself.
         self.alerts: list[list[api.Alert] | Exception | None] = [None] * len(times)
         # Full alert text by URL, shared between frames.
@@ -164,12 +167,15 @@ class Slideshow:
                 png = api.fetch_frame(
                     self.layer, ts, *self.size, render.bgcolor(self.theme), self.overlays
                 )
+                if markers is not None:
+                    self.plain[i] = sixel.encode(render.compose(png, legend, self.theme))
                 self.frames[i] = sixel.encode(render.compose(png, legend, self.theme, markers))
             except Exception as e:
-                self.frames[i] = e
+                self.plain[i] = self.frames[i] = e
 
     def _show(self, index: int) -> None:
-        frame = self.frames[index]
+        hidden = self.markers and not self.show_markers
+        frame = (self.plain if hidden else self.frames)[index]
         if isinstance(frame, Exception):
             body = f"Could not load capture {index + 1}: {frame}\r\n".encode()
         else:
@@ -213,6 +219,9 @@ class Slideshow:
         help_text = "space: play/pause  ←/→: step  "
         if self.timed:
             help_text += "m: messages  "
+        help_text += f"l: {'stop looping' if self.loop else 'loop'}  "
+        if self.markers:
+            help_text += f"t: {'hide' if self.show_markers else 'show'} markers  "
         lines.append((help_text + "q/esc: quit")[:cols])
         return "\r\n".join(lines)
 
@@ -385,6 +394,11 @@ class Slideshow:
                 playing = False
                 target = current
                 self._open_messages(current)
+            elif key == "loop":
+                self.loop = not self.loop
+            elif key == "markers" and self.markers and current is not None:
+                self.show_markers = not self.show_markers
+                self._show(current)
             elif key == "space":
                 if playing:
                     playing = False
@@ -447,7 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="overlays: "
         + "; ".join(f"{k} = {o.description}" for k, o in api.OVERLAYS.items())
         + ". keys: space play/pause, left/right step, m read alert messages "
-        "(with hazards/warnings), q or esc quit",
+        "(with hazards/warnings), l loop on/off, t show/hide markers, q or esc quit",
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(

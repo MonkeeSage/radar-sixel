@@ -41,13 +41,15 @@ range the newest `-n` captures cover, and describes any `-o` overlays.
 
 The newest `-n` captures are fetched one at a time, oldest first, and the
 slideshow advances as each one finishes loading. It plays once and stays on
-the last frame until you quit (or loops with `--loop`).
+the last frame until you quit (or loops with `--loop` or the `l` key).
 
 | Key         | Action                                      |
 |-------------|---------------------------------------------|
 | space       | pause / resume (replays from the start at the end) |
 | left/right  | pause and step to the previous / next frame |
 | m           | read the full alert messages (with `-o hazards`/`-o warnings`) |
+| l           | turn looping on / off                       |
+| t           | show / hide the `--marker` pins and labels  |
 | q, esc      | quit                                        |
 
 Options:

@@ -58,7 +58,7 @@ def make_show(monkeypatch):
     monkeypatch.setattr(api, "fetch_alerts", lambda overlays, bbox, ts, snapshots: ALERTS)
     monkeypatch.setattr(api, "fetch_alert_text", lambda alert: TEXTS[alert.url])
 
-    def make(keys, delay, loop=False, overlays=(), markers=None):
+    def make(keys, delay, loop=False, overlays=(), markers=None, station_count=1):
         layer = api.Layer("kabx", "sr_bref", "", "", (0, 0, 1, 1), tuple(TIMES))
         show = cli.Slideshow(
             None,
@@ -71,6 +71,7 @@ def make_show(monkeypatch):
             legend=True,
             overlays=overlays,
             markers=markers,
+            station_count=station_count,
         )
         show.term = FakeTerm(keys, show)
         shown = []
@@ -199,6 +200,43 @@ def test_t_ignored_without_markers(make_show):
     assert shown == [0]
     assert show.plain == [None] * 3
     assert "t:" not in show._status_text(0, 0, False)
+
+
+def test_s_switches_station_and_resumes(make_show):
+    show, shown = make_show([None, "space", "right", "station"], delay=100, station_count=2)
+    assert show.run() == "station"
+    assert shown == [0, 1]
+    assert "s: next station (1/2)" in show._status_text(1, 1, False)
+    fetcher = show._fetcher
+    show.term.keys = [None, "right"]
+    assert show.run() == "quit"
+    # Back on this station: redrawn where it was, still paused, not refetched.
+    assert shown == [0, 1, 1, 2]
+    assert show._fetcher is fetcher
+
+
+def test_s_ignored_with_one_station(make_show):
+    show, shown = make_show([None, "space", "station"], delay=100)
+    assert show.run() == "quit"
+    assert shown == [0]
+    assert "s:" not in show._status_text(0, 0, False)
+
+
+def test_cycle_stations_wraps_and_carries_toggles():
+    class Show:
+        def __init__(self, name, results):
+            self.name, self.results = name, results
+            self.loop = self.show_markers = False
+
+        def run(self):
+            order.append((self.name, self.loop, self.show_markers))
+            self.loop = self.show_markers = True
+            return self.results.pop(0)
+
+    order = []
+    a, b = Show("a", ["station", "quit"]), Show("b", ["station"])
+    cli.cycle_stations([a, b])
+    assert order == [("a", False, False), ("b", True, True), ("a", True, True)]
 
 
 def test_fill_line():

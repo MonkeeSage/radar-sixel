@@ -42,6 +42,12 @@ def test_products_marks_default(capsys):
     assert "Overlays" not in out
 
 
+def test_repeated_station_lists_each(capsys, fake_layers):
+    assert cli.main(["-s", "kabx", "-s", "KFWS", "-s", "kabx", "--products"]) == 0
+    assert fake_layers == ["kabx", "kfws"]
+    assert capsys.readouterr().out.count("products (* = selected") == 2
+
+
 def test_unknown_product_errors(capsys):
     with pytest.raises(SystemExit):
         cli.main(["-r", "conus", "--products", "-p", "sr_bvel"])
@@ -83,6 +89,8 @@ def test_markers_outside_map_are_skipped(capsys):
     err = capsys.readouterr().err
     assert "marker 'out' (5,5) is outside the map area" in err
     assert "marker -1,0.5 is outside" in err
+    cli.place_markers(markers[1:2], (0, 0, 1, 1), (100, 100), "KFWS")
+    assert "outside the KFWS map area" in capsys.readouterr().err
 
 
 def test_parse_color():

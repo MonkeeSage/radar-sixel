@@ -29,6 +29,7 @@ radar-sixel -s KABX             # last 10 base reflectivity captures
 radar-sixel -s KABX -n 1        # just the newest capture
 radar-sixel -s KFWS -p sr_bvel -n 5 -d 0.8 --loop --theme light
 radar-sixel -s KFWS -o counties -o warnings      # add map overlays
+radar-sixel -s KFWS -s KGRK -s KDYX              # press s to switch stations
 radar-sixel -r conus -p cref_qcd -o hazards      # regional mosaic
 radar-sixel -s KFWS --marker 32.7555,-97.3308,"Fort Worth" --marker 32.78,-96.8
 radar-sixel -s KFWS --marker 32.7555,-97.3308,Home --marker-color "#f80" --marker-opacity 60 --marker-size 32
@@ -50,12 +51,17 @@ the last frame until you quit (or loops with `--loop` or the `l` key).
 | m           | read the full alert messages (with `-o hazards`/`-o warnings`) |
 | l           | turn looping on / off                       |
 | t           | show / hide the `--marker` pins and labels  |
+| s           | switch to the next `-s` station (with several) |
 | q, esc      | quit                                        |
 
 Options:
 
 - `-s, --station` / `-r, --region` – a radar station, or one of the MRMS
-  mosaics `conus`, `alaska`, `hawaii`, `carib`, `guam`
+  mosaics `conus`, `alaska`, `hawaii`, `carib`, `guam`. `-s` is repeatable:
+  the `s` key cycles through the stations in the order given. Each station
+  starts loading when first shown and resumes where it left off when you come
+  back to it; `-p` must be available at every station (without it, each uses
+  its own default), and `--products` lists each station's products
 - `-p, --product` – base reflectivity by default. NEXRAD: `sr_bref`, `sr_bvel`,
   `bdhc`, `boha`, `bdsa`; TDWR stations (`T...`): `bref1`, `brefl`, `bvel`;
   regions: `bref_qcd`, `cref_qcd` (composite), `neet_v18` (echo tops),

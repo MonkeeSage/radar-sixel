@@ -61,14 +61,18 @@ def parse_marker(value: str) -> Marker:
 
 
 def place_markers(
-    markers: list[Marker], bbox: tuple[float, float, float, float], size: tuple[int, int]
+    markers: list[Marker],
+    bbox: tuple[float, float, float, float],
+    size: tuple[int, int],
+    where: str = "",
 ) -> list[tuple[float, float, str]]:
     """Pixel positions and labels of the markers, warning about any off the map."""
+    area = f"the {where} map area" if where else "the map area"
     placed = []
     for marker in markers:
         pos = render.marker_position(bbox, size, marker.lat, marker.lon)
         if pos is None:
-            print(f"{PROG}: marker {marker} is outside the map area; skipping", file=sys.stderr)
+            print(f"{PROG}: marker {marker} is outside {area}; skipping", file=sys.stderr)
         else:
             placed.append((*pos, marker.label))
     return placed
@@ -104,6 +108,8 @@ class Slideshow:
         marker_color: tuple[int, int, int] | None = None,
         marker_opacity: float = render.MARKER_OPACITY,
         marker_size: int = render.PIN_HEIGHT,
+        station_index: int = 0,
+        station_count: int = 1,
     ) -> None:
         self.term = term
         self.layer = layer
@@ -119,6 +125,9 @@ class Slideshow:
         self.marker_color = marker_color
         self.marker_opacity = marker_opacity
         self.marker_size = marker_size
+        # Position among the -s stations the s key cycles through.
+        self.station_index = station_index
+        self.station_count = station_count
         self.timed = tuple(o for o in overlays if api.OVERLAYS[o].timed)
         # Each slot holds encoded sixel bytes, the fetch error, or None (pending).
         self.frames: list[bytes | Exception | None] = [None] * len(times)
@@ -131,6 +140,10 @@ class Slideshow:
         self.texts: dict[str, api.AlertText | Exception] = {}
         self.messages: Messages | None = None
         self._status = ""
+        self._fetcher: threading.Thread | None = None
+        # (current, target, playing), kept so switching back to this station
+        # resumes where it left off.
+        self._position: tuple[int | None, int, bool] = (None, 0, True)
 
     def _fetch_all(self) -> None:
         legend = None
@@ -222,6 +235,8 @@ class Slideshow:
         help_text += f"l: {'stop looping' if self.loop else 'loop'}  "
         if self.markers:
             help_text += f"t: {'hide' if self.show_markers else 'show'} markers  "
+        if self.station_count > 1:
+            help_text += f"s: next station ({self.station_index + 1}/{self.station_count})  "
         lines.append((help_text + "q/esc: quit")[:cols])
         return "\r\n".join(lines)
 
@@ -347,22 +362,27 @@ class Slideshow:
         else:
             messages.offset += delta[key]
 
-    def run(self) -> None:
+    def run(self) -> str:
+        """Play until quit; return "quit", or "station" to switch stations."""
         n = len(self.times)
-        threading.Thread(target=self._fetch_all, daemon=True).start()
+        if self._fetcher is None:
+            self._fetcher = threading.Thread(target=self._fetch_all, daemon=True)
+            self._fetcher.start()
 
-        self.term.write(f"{CSI}H{CSI}2J{ESC}7")
-        current: int | None = None
-        target = 0
-        playing = True
-        next_due = 0.0
+        current, target, playing = self._position
+        if current is None:
+            self.term.write(f"{CSI}H{CSI}2J{ESC}7")
+            self._status = ""
+        else:
+            self._show(current)
+        next_due = time.monotonic() + self.delay
 
         while True:
             if self.messages is not None:
                 self._draw_messages()
                 key = self.term.read_key(0.1)
                 if key == "quit":
-                    return
+                    return "quit"
                 if key in ("esc", "messages"):
                     self.messages = None
                     assert current is not None
@@ -389,7 +409,10 @@ class Slideshow:
 
             key = self.term.read_key(0.1)
             if key in ("quit", "esc"):
-                return
+                return "quit"
+            if key == "station" and self.station_count > 1:
+                self._position = (current, target, playing)
+                return "station"
             if key == "messages" and self.timed and current is not None:
                 playing = False
                 target = current
@@ -461,7 +484,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="overlays: "
         + "; ".join(f"{k} = {o.description}" for k, o in api.OVERLAYS.items())
         + ". keys: space play/pause, left/right step, m read alert messages "
-        "(with hazards/warnings), l loop on/off, t show/hide markers, q or esc quit",
+        "(with hazards/warnings), l loop on/off, t show/hide markers, s next station "
+        "(with several -s), q or esc quit",
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
@@ -472,7 +496,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILTER",
         help="list stations, optionally filtered by ID, name or WFO",
     )
-    source.add_argument("-s", "--station", help="station ID, e.g. KABX")
+    source.add_argument(
+        "-s",
+        "--station",
+        action="append",
+        help="station ID, e.g. KABX; repeat to cycle between stations with the s key",
+    )
     source.add_argument(
         "-r",
         "--region",
@@ -640,6 +669,16 @@ def fit_size(
     return render.map_size(layer.bbox, box, max_height)
 
 
+def cycle_stations(shows: list[Slideshow]) -> None:
+    """Run each station's slideshow in turn as the s key is pressed."""
+    i = 0
+    while shows[i].run() == "station":
+        nxt = shows[(i + 1) % len(shows)]
+        # The l and t toggles carry over to the next station.
+        nxt.loop, nxt.show_markers = shows[i].loop, shows[i].show_markers
+        i = (i + 1) % len(shows)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -648,27 +687,39 @@ def main(argv: list[str] | None = None) -> int:
         if args.list is not None:
             print_stations(args.list)
             return 0
-        workspace = args.station or args.region
-        if not workspace:
-            parser.error("one of --list, --station or --region is required")
         # Keep the order given, dropping repeats.
+        workspaces = list(dict.fromkeys(s.lower() for s in args.station or ()))
+        if args.region:
+            workspaces = [args.region]
+        if not workspaces:
+            parser.error("one of --list, --station or --region is required")
         overlays = tuple(dict.fromkeys(args.overlay))
 
-        layers = api.workspace_layers(workspace)
-        product = args.product or api.default_product(layers)
-        if product not in layers:
-            parser.error(
-                f"{workspace.upper()} has no product {product!r} "
-                f"(available: {', '.join(sorted(layers))})"
-            )
+        # Check every station before showing anything.
+        selected: list[tuple[dict[str, api.Layer], str]] = []
+        for workspace in workspaces:
+            layers = api.workspace_layers(workspace)
+            product = args.product or api.default_product(layers)
+            if product not in layers:
+                parser.error(
+                    f"{workspace.upper()} has no product {product!r} "
+                    f"(available: {', '.join(sorted(layers))})"
+                )
+            selected.append((layers, product))
         if args.products:
-            print_products(layers, product, args.count, list(overlays))
+            for i, (layers, product) in enumerate(selected):
+                if i:
+                    print()
+                print_products(layers, product, args.count, list(overlays))
             return 0
 
-        layer = layers[product]
-        times = list(layer.times[-args.count :])
-        if not times:
-            raise api.ApiError(f"no captures available for {layer.name}")
+        shown: list[tuple[api.Layer, list[str]]] = []
+        for layers, product in selected:
+            layer = layers[product]
+            times = list(layer.times[-args.count :])
+            if not times:
+                raise api.ApiError(f"no captures available for {layer.name}")
+            shown.append((layer, times))
 
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
             parser.error("the slideshow needs an interactive terminal")
@@ -679,25 +730,37 @@ def main(argv: list[str] | None = None) -> int:
                     "this terminal does not report sixel support (use --force to try anyway)"
                 )
             timed = any(api.OVERLAYS[o].timed for o in overlays)
-            size = fit_size(term, layer, args.size, not args.no_legend, timed)
-            # Warnings go to the main screen, which is restored on exit.
-            markers = place_markers(list(dict.fromkeys(args.marker)), layer.bbox, size)
+            shows = []
+            for i, (layer, times) in enumerate(shown):
+                size = fit_size(term, layer, args.size, not args.no_legend, timed)
+                # Warnings go to the main screen, which is restored on exit.
+                markers = place_markers(
+                    list(dict.fromkeys(args.marker)),
+                    layer.bbox,
+                    size,
+                    layer.workspace.upper() if len(shown) > 1 else "",
+                )
+                shows.append(
+                    Slideshow(
+                        term,
+                        layer,
+                        times,
+                        size,
+                        args.theme,
+                        args.delay,
+                        args.loop,
+                        legend=not args.no_legend,
+                        overlays=overlays,
+                        markers=markers,
+                        marker_color=args.marker_color,
+                        marker_opacity=args.marker_opacity / 100,
+                        marker_size=args.marker_size,
+                        station_index=i,
+                        station_count=len(shown),
+                    )
+                )
             term.enter_alt_screen()
-            Slideshow(
-                term,
-                layer,
-                times,
-                size,
-                args.theme,
-                args.delay,
-                args.loop,
-                legend=not args.no_legend,
-                overlays=overlays,
-                markers=markers,
-                marker_color=args.marker_color,
-                marker_opacity=args.marker_opacity / 100,
-                marker_size=args.marker_size,
-            ).run()
+            cycle_stations(shows)
     except api.ApiError as e:
         print(f"{PROG}: error: {e}", file=sys.stderr)
         return 1

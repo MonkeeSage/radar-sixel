@@ -36,6 +36,8 @@ _KEYS = {
     b" ": "space",
     b"m": "messages",
     b"M": "messages",
+    b"s": "station",
+    b"S": "station",
     b"l": "loop",
     b"L": "loop",
     b"t": "markers",

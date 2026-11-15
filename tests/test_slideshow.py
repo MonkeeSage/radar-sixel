@@ -49,7 +49,7 @@ def make_show(monkeypatch):
     monkeypatch.setattr(api, "fetch_legend", lambda layer: b"")
     monkeypatch.setattr(api, "fetch_frame", lambda layer, ts, w, h, bg, overlays=(): ts.encode())
     monkeypatch.setattr(cli.render, "load_legend", lambda data: None)
-    monkeypatch.setattr(cli.render, "compose", lambda png, legend, theme: png)
+    monkeypatch.setattr(cli.render, "compose", lambda png, legend, theme, markers=None: png)
     monkeypatch.setattr(cli.sixel, "encode", lambda image: image)
     monkeypatch.setattr(api, "overlay_times", lambda: {})
     monkeypatch.setattr(api, "fetch_alerts", lambda overlays, bbox, ts, snapshots: ALERTS)

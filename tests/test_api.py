@@ -183,3 +183,65 @@ def test_alert_text_only_from_weather_gov(monkeypatch):
     alert = api.Alert("Flood Warning", "KCRP", "W", "https://example.com/x", None)
     with pytest.raises(api.ApiError, match="unexpected alert URL"):
         api.fetch_alert_text(alert)
+
+
+def test_marker_position():
+    bbox = (-100.0, 30.0, -90.0, 40.0)
+    assert render.marker_position(bbox, (100, 200), 30.0, -100.0) == pytest.approx((0, 200))
+    assert render.marker_position(bbox, (100, 200), 40.0, -90.0) == pytest.approx((100, 0))
+    x, y = render.marker_position(bbox, (100, 200), 35.0, -95.0)
+    # Web Mercator stretches latitude, so the midpoint sits below the center.
+    assert x == pytest.approx(50) and y > 100
+    assert render.marker_position(bbox, (100, 200), 41.0, -95.0) is None
+    assert render.marker_position(bbox, (100, 200), 35.0, -89.0) is None
+
+
+def test_markers_are_composited_faintly():
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (120, 80), render.THEMES["dark"]).save(buf, "PNG")
+    layer = render.marker_layer((120, 80), [(60, 70, "Home")], "dark")
+    out = render.compose(buf.getvalue(), None, "dark", layer)
+    assert out.size == (120, 80)
+    # The white pin's center blends to ~30% over the background.
+    r = out.getpixel((60, 70 - render.PIN_HEIGHT + render.PIN_RADIUS - 4))[0]
+    bg = render.THEMES["dark"][0]
+    assert r == pytest.approx(bg + (255 - bg) * render.MARKER_OPACITY, abs=8)
+    # The label above the pin is drawn opaque.
+    label = out.crop((0, 0, 120, 70 - render.PIN_HEIGHT))
+    assert label.getextrema()[0][1] == 255
+
+
+def test_marker_color_and_opacity():
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (120, 80), render.THEMES["dark"]).save(buf, "PNG")
+    center = (60, 70 - render.PIN_HEIGHT + render.PIN_RADIUS - 4)
+    layer = render.marker_layer((120, 80), [(60, 70, "")], "dark", (255, 0, 0), 1.0)
+    assert render.compose(buf.getvalue(), None, "dark", layer).getpixel(center) == (255, 0, 0)
+    layer = render.marker_layer((120, 80), [(60, 70, "")], "dark", (255, 0, 0), 0.0)
+    out = render.compose(buf.getvalue(), None, "dark", layer)
+    assert out.getpixel(center) == render.THEMES["dark"]
+    assert render.contrast((255, 255, 0)) == (0, 0, 0)
+    assert render.contrast((0, 0, 128)) == (255, 255, 255)
+
+
+def test_marker_size():
+    def pin_rows(height):
+        layer = render.marker_layer((120, 120), [(60, 100, "")], "dark", pin_height=height)
+        # Measure at half the peak alpha, ignoring the antialiasing fringe.
+        alpha = layer.getchannel("A")
+        half = alpha.getextrema()[1] // 2
+        top, bottom = alpha.point(lambda a: 255 if a > half else 0).getbbox()[1::2]
+        return top, bottom
+
+    for height in (10, 22, 60):
+        top, bottom = pin_rows(height)
+        assert bottom == pytest.approx(100, abs=1)
+        assert bottom - top == pytest.approx(height, abs=2)

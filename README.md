@@ -30,6 +30,8 @@ radar-sixel -s KABX -n 1        # just the newest capture
 radar-sixel -s KFWS -p sr_bvel -n 5 -d 0.8 --loop --theme light
 radar-sixel -s KFWS -o counties -o warnings      # add map overlays
 radar-sixel -r conus -p cref_qcd -o hazards      # regional mosaic
+radar-sixel -s KFWS --marker 32.7555,-97.3308,"Fort Worth" --marker 32.78,-96.8
+radar-sixel -s KFWS --marker 32.7555,-97.3308,Home --marker-color "#f80" --marker-opacity 60 --marker-size 32
 radar-sixel -r conus -p cref_qcd -n 5 --products # what would be shown
 ```
 
@@ -57,6 +59,16 @@ Options:
   regions: `bref_qcd`, `cref_qcd` (composite), `neet_v18` (echo tops),
   `pcpn_typ` (precipitation type)
 - `-o, --overlay` – repeatable; see below
+- `--marker LAT,LON[,LABEL]` – repeatable; draws a pin at 30% opacity at that
+  location, with the label (if given) above it. Markers outside the map are
+  skipped with a message on stderr
+- `--marker-opacity PERCENT` – pin opacity from 0 to 100 (default 30); labels
+  are always opaque
+- `--marker-size PX` – pin height in pixels (default 22); the label sits just
+  above the pin
+- `--marker-color HEX` – pin and label color, `#RRGGBB` or `#RGB` (`#`
+  optional; default white on the dark theme, black on light). The outline is
+  black or white, whichever contrasts more
 - `-n, --count` – number of captures (default 10)
 - `-d, --delay` – seconds between frames (default 1.5)
 - `--loop` – loop instead of stopping on the last frame

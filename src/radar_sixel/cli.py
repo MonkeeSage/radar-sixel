@@ -35,6 +35,45 @@ def fill_line(text: str, cols: int) -> str:
     return f"{text}{CSI}0;8m{' ' * pad}{CSI}0m" if pad > 0 else text
 
 
+@dataclass(frozen=True)
+class Marker:
+    lat: float
+    lon: float
+    label: str = ""
+
+    def __str__(self) -> str:
+        where = f"{self.lat:g},{self.lon:g}"
+        return f"{self.label!r} ({where})" if self.label else where
+
+
+def parse_marker(value: str) -> Marker:
+    """argparse type for --marker LAT,LON[,LABEL]."""
+    parts = value.split(",", 2)
+    if len(parts) < 2:
+        raise argparse.ArgumentTypeError(f"expected LAT,LON[,LABEL], got {value!r}")
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid coordinates in {value!r}") from None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise argparse.ArgumentTypeError(f"coordinates out of range in {value!r}")
+    return Marker(lat, lon, parts[2].strip() if len(parts) > 2 else "")
+
+
+def place_markers(
+    markers: list[Marker], bbox: tuple[float, float, float, float], size: tuple[int, int]
+) -> list[tuple[float, float, str]]:
+    """Pixel positions and labels of the markers, warning about any off the map."""
+    placed = []
+    for marker in markers:
+        pos = render.marker_position(bbox, size, marker.lat, marker.lon)
+        if pos is None:
+            print(f"{PROG}: marker {marker} is outside the map area; skipping", file=sys.stderr)
+        else:
+            placed.append((*pos, marker.label))
+    return placed
+
+
 @dataclass
 class Messages:
     """State of the full-text alert view for one frame."""
@@ -61,6 +100,10 @@ class Slideshow:
         loop: bool,
         legend: bool,
         overlays: tuple[str, ...] = (),
+        markers: list[tuple[float, float, str]] | None = None,
+        marker_color: tuple[int, int, int] | None = None,
+        marker_opacity: float = render.MARKER_OPACITY,
+        marker_size: int = render.PIN_HEIGHT,
     ) -> None:
         self.term = term
         self.layer = layer
@@ -71,6 +114,11 @@ class Slideshow:
         self.loop = loop
         self.legend = legend
         self.overlays = overlays
+        # Marker pixel positions and labels, already limited to the map.
+        self.markers = markers or []
+        self.marker_color = marker_color
+        self.marker_opacity = marker_opacity
+        self.marker_size = marker_size
         self.timed = tuple(o for o in overlays if api.OVERLAYS[o].timed)
         # Each slot holds encoded sixel bytes, the fetch error, or None (pending).
         self.frames: list[bytes | Exception | None] = [None] * len(times)
@@ -88,6 +136,16 @@ class Slideshow:
                 legend = render.load_legend(api.fetch_legend(self.layer))
             except Exception:
                 pass  # The legend is optional; frames still render without it.
+        markers = None
+        if self.markers:
+            markers = render.marker_layer(
+                self.size,
+                self.markers,
+                self.theme,
+                self.marker_color,
+                self.marker_opacity,
+                self.marker_size,
+            )
         snapshots: dict[str, tuple[str, ...]] | Exception = {}
         if self.timed:
             try:
@@ -106,7 +164,7 @@ class Slideshow:
                 png = api.fetch_frame(
                     self.layer, ts, *self.size, render.bgcolor(self.theme), self.overlays
                 )
-                self.frames[i] = sixel.encode(render.compose(png, legend, self.theme))
+                self.frames[i] = sixel.encode(render.compose(png, legend, self.theme, markers))
             except Exception as e:
                 self.frames[i] = e
 
@@ -358,6 +416,27 @@ def _positive_float(value: str) -> float:
     return n
 
 
+def _percent(value: str) -> int:
+    n = int(value)
+    if not 0 <= n <= 100:
+        raise argparse.ArgumentTypeError("must be from 0 to 100")
+    return n
+
+
+HEX_COLOR_RE = re.compile(r"#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})")
+
+
+def parse_color(value: str) -> tuple[int, int, int]:
+    """argparse type for a hex color: #RRGGBB or #RGB, the # optional."""
+    match = HEX_COLOR_RE.fullmatch(value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(f"expected a hex color like #FF8800, got {value!r}")
+    digits = match.group(1)
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    return tuple(int(digits[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -408,6 +487,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=str.lower,
         choices=list(api.OVERLAYS),
         help="add a map overlay; repeat for more (see below)",
+    )
+    parser.add_argument(
+        "--marker",
+        action="append",
+        default=[],
+        type=parse_marker,
+        metavar="LAT,LON[,LABEL]",
+        help="mark a location on the map, with an optional label; repeat for more",
+    )
+    parser.add_argument(
+        "--marker-opacity",
+        type=_percent,
+        default=round(render.MARKER_OPACITY * 100),
+        metavar="PERCENT",
+        help="marker pin opacity from 0 to 100 (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--marker-size",
+        type=_positive_int,
+        default=render.PIN_HEIGHT,
+        metavar="PX",
+        help="marker pin height in pixels (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--marker-color",
+        type=parse_color,
+        metavar="HEX",
+        help="marker pin and label color, e.g. '#FF8800' (default: white on the "
+        "dark theme, black on light)",
     )
     parser.add_argument(
         "-n",
@@ -558,6 +666,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             timed = any(api.OVERLAYS[o].timed for o in overlays)
             size = fit_size(term, layer, args.size, not args.no_legend, timed)
+            # Warnings go to the main screen, which is restored on exit.
+            markers = place_markers(list(dict.fromkeys(args.marker)), layer.bbox, size)
             term.enter_alt_screen()
             Slideshow(
                 term,
@@ -569,6 +679,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.loop,
                 legend=not args.no_legend,
                 overlays=overlays,
+                markers=markers,
+                marker_color=args.marker_color,
+                marker_opacity=args.marker_opacity / 100,
+                marker_size=args.marker_size,
             ).run()
     except api.ApiError as e:
         print(f"{PROG}: error: {e}", file=sys.stderr)

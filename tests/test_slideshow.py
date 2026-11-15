@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from radar_sixel import api, cli
+from radar_sixel import api, cli, term
 
 TIMES = [f"2026-11-15T00:0{i}:00.000Z" for i in range(3)]
 ENDS = datetime(2026, 11, 15, 1, 0, tzinfo=timezone.utc)
@@ -204,3 +204,22 @@ def test_t_ignored_without_markers(make_show):
 def test_fill_line():
     assert cli.fill_line("ab", 4) == f"ab{cli.CSI}0;8m  {cli.CSI}0m"
     assert cli.fill_line(f"{cli.CSI}1mab{cli.CSI}0m", 2) == f"{cli.CSI}1mab{cli.CSI}0m"
+
+
+def test_exit_blanks_every_cell(monkeypatch):
+    t = term.Terminal.__new__(term.Terminal)
+    t._alt_screen = True
+    out = []
+    monkeypatch.setattr(t, "write", out.append)
+    monkeypatch.setattr(t, "size", lambda: (3, 5, 0, 0))
+    monkeypatch.setattr(term.time, "sleep", lambda s: out.append(s))
+    t.leave_alt_screen()
+    blank = f"{cli.CSI}0;8m     {cli.CSI}0m"
+    # The blank screen is written and left up before switching back.
+    assert out == [
+        "".join(f"{cli.CSI}{y};1H{blank}" for y in (1, 2, 3)),
+        term.BLANK_DELAY,
+        f"{cli.CSI}?25h{cli.CSI}?1049l",
+    ]
+    t.leave_alt_screen()
+    assert len(out) == 3

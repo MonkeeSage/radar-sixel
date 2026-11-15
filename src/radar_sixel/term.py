@@ -13,6 +13,8 @@ import tty
 
 ESC = "\x1b"
 CSI = ESC + "["
+# Seconds to leave the blanked screen up before leaving the alternate screen.
+BLANK_DELAY = 0.1
 
 _KEYS = {
     b"\x1b[D": "left",
@@ -78,7 +80,22 @@ class Terminal:
     def leave_alt_screen(self) -> None:
         if self._alt_screen:
             self._alt_screen = False
+            self.write(self.blank_screen())
+            # The blank screen has to actually be displayed before switching
+            # back; tmux, for one, only redraws the final state of a batch.
+            time.sleep(BLANK_DELAY)
             self.write(f"{CSI}?25h{CSI}?1049l")
+
+    def blank_screen(self) -> str:
+        """Fill every cell with concealed spaces.
+
+        Like the messages view (see cli.fill_line), this makes terminals that
+        only repaint changed cells drop any sixel image still on screen.
+        """
+        rows, cols = self.size()[:2]
+        rows, cols = rows or 24, cols or 80
+        row = f"{CSI}0;8m{' ' * cols}{CSI}0m"
+        return "".join(f"{CSI}{y};1H{row}" for y in range(1, rows + 1))
 
     def size(self) -> tuple[int, int, int, int]:
         """Return (rows, cols, pixel width, pixel height); pixels may be 0."""

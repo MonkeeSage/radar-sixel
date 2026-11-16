@@ -49,6 +49,7 @@ the last frame until you quit (or loops with `--loop` or the `l` key).
 | space       | pause / resume (replays from the start at the end) |
 | left/right  | pause and step to the previous / next frame |
 | m           | read the full alert messages (with `-o hazards`/`-o warnings`) |
+| h, w        | show / hide the `hazards` / `warnings` overlays |
 | l           | turn looping on / off                       |
 | t           | show / hide the `--marker` pins and labels  |
 | s           | switch to the next `-s` station (with several) |
@@ -98,12 +99,20 @@ Overlays (state and country borders are always drawn):
 | `hazards`   | `wwa:hazards`         | advisories/watches/warnings, filled, drawn under the radar |
 | `warnings`  | `wwa:warnings`        | tornado/severe/flash flood/marine warnings, outlined on top |
 
-`hazards` and `warnings` are matched to each frame's capture time.
+`hazards` and `warnings` are matched to each frame's capture time. The `h`
+and `w` keys turn them on and off in the slideshow, whether or not they were
+given with `-o`. The frames for a new combination are fetched starting from
+the one on screen, and each combination is kept, so switching back is
+instant.
 
-With either of them, the alerts in view for the current frame are summarized
-under the status line, one line per event type and colored by significance
-(warnings red, watches yellow, advisories cyan), with short-fuse warnings such
-as tornado and severe thunderstorm listed first. Press `m` to pause and read
+With either of them, the alerts in view for the current frame are listed to
+the right of the map: one entry per event type with its forecast offices and
+end time, colored by significance (warnings red, watches yellow, advisories
+cyan), with short-fuse warnings such as tornado and severe thunderstorm
+first. If the terminal does not report its pixel size, or leaves fewer than
+30 columns beside the map, a single line under the status line shows the most
+severe one with a count of the others instead (or "No warning or alert
+overlays." without them). Press `m` to pause and read
 the full messages (headline, areas, description and instructions) from
 [api.weather.gov](https://www.weather.gov/documentation/services-web-api);
 scroll with the arrow keys, PgUp/PgDn, Home/End or j/k, and press `m` or esc

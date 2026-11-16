@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import textwrap
@@ -15,9 +16,11 @@ from . import __version__, api, render, sixel
 from .term import CSI, ESC, Terminal
 
 PROG = "radar-sixel"
+# Status and help lines under the map.
 STATUS_LINES = 2
-# Alert summary lines under the status line when hazards/warnings are shown.
-ALERT_LINES = 4
+# Smallest side panel worth showing, and its gap from the map, in columns.
+PANEL_MIN_WIDTH = 30
+PANEL_GAP = 2
 SIG_COLORS = {"W": "31", "A": "33", "Y": "36"}
 SCROLL_KEYS = {"up", "down", "pageup", "pagedown", "home", "end"}
 SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -58,6 +61,26 @@ def parse_marker(value: str) -> Marker:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         raise argparse.ArgumentTypeError(f"coordinates out of range in {value!r}")
     return Marker(lat, lon, parts[2].strip() if len(parts) > 2 else "")
+
+
+def side_panel(
+    term_size: tuple[int, int, int, int], map_size: tuple[int, int]
+) -> tuple[int, int, int] | None:
+    """First column, width and rows of the alert panel right of the map.
+
+    None if the terminal does not report its pixel size or the panel would
+    be too narrow; the alert summary then goes under the status line.
+    """
+    rows, cols, xpix, ypix = term_size
+    if not (rows and cols and xpix and ypix):
+        return None
+    first = math.ceil(map_size[0] * cols / xpix) + PANEL_GAP + 1
+    # The last column is left alone so no line can wrap.
+    width = cols - first
+    height = int(map_size[1] * rows / ypix)
+    if width < PANEL_MIN_WIDTH or height < 1:
+        return None
+    return first, width, height
 
 
 def place_markers(
@@ -128,22 +151,59 @@ class Slideshow:
         # Position among the -s stations the s key cycles through.
         self.station_index = station_index
         self.station_count = station_count
-        self.timed = tuple(o for o in overlays if api.OVERLAYS[o].timed)
-        # Each slot holds encoded sixel bytes, the fetch error, or None (pending).
-        self.frames: list[bytes | Exception | None] = [None] * len(times)
-        # The same frames without markers, filled in just before self.frames.
-        self.plain: list[bytes | Exception | None] = [None] * len(times)
+        # Frames, frames without markers, and alerts for each set of timed
+        # overlays shown so far, keyed by that set; the h and w keys switch
+        # between them.
+        self._cache: dict[tuple[str, ...], tuple[list, list, list]] = {}
+        self._select()
         self.show_markers = True
-        # Alerts in view per frame, filled in before the frame itself.
-        self.alerts: list[list[api.Alert] | Exception | None] = [None] * len(times)
         # Full alert text by URL, shared between frames.
         self.texts: dict[str, api.AlertText | Exception] = {}
         self.messages: Messages | None = None
         self._status = ""
+        # Side panel lines on screen.
+        self._panel: list[str] = []
         self._fetcher: threading.Thread | None = None
+        # Wakes the fetcher when an overlay toggle gives it more to fetch.
+        self._wake = threading.Condition()
+        # Frame the fetcher starts from: the one on screen when toggled.
+        self._fetch_from = 0
+        # The timed overlays of the frame on screen.
+        self._shown_timed: tuple[str, ...] | None = None
         # (current, target, playing), kept so switching back to this station
         # resumes where it left off.
         self._position: tuple[int | None, int, bool] = (None, 0, True)
+
+    def _select(self) -> None:
+        """Point frames, plain and alerts at the cache for the current overlays."""
+        self.timed = tuple(o for o in api.OVERLAYS if o in self.overlays and api.OVERLAYS[o].timed)
+        n = len(self.times)
+        # Each frame slot holds encoded sixel bytes, the fetch error, or None
+        # (pending). plain holds the same frames without markers, filled in
+        # just before frames; alerts holds the alerts in view per frame,
+        # filled in before the frame itself.
+        self.frames, self.plain, self.alerts = self._cache.setdefault(
+            self.timed, ([None] * n, [None] * n, [None] * n)
+        )
+
+    def _toggle_overlay(self, name: str, current: int | None) -> None:
+        with self._wake:
+            if name in self.overlays:
+                self.overlays = tuple(o for o in self.overlays if o != name)
+            else:
+                self.overlays += (name,)
+            self._select()
+            self._fetch_from = current or 0
+            self._wake.notify()
+
+    def _next_fetch(self) -> tuple[tuple[str, ...], tuple[str, ...], tuple, int] | None:
+        """The overlays, timed overlays, cache entry and frame to fetch next."""
+        n = len(self.times)
+        for k in range(n):
+            i = (self._fetch_from + k) % n
+            if self.frames[i] is None:
+                return self.overlays, self.timed, (self.frames, self.plain, self.alerts), i
+        return None
 
     def _fetch_all(self) -> None:
         legend = None
@@ -162,29 +222,35 @@ class Slideshow:
                 self.marker_opacity,
                 self.marker_size,
             )
-        snapshots: dict[str, tuple[str, ...]] | Exception = {}
-        if self.timed:
-            try:
-                snapshots = api.overlay_times()
-            except Exception as e:
-                snapshots = e
-        for i, ts in enumerate(self.times):
-            if self.timed:
+        # Fetched the first time a timed overlay is shown.
+        snapshots: dict[str, tuple[str, ...]] | Exception | None = None
+        while True:
+            with self._wake:
+                while (work := self._next_fetch()) is None:
+                    self._wake.wait()
+            overlays, timed, (frames, plain, alerts), i = work
+            ts = self.times[i]
+            if timed:
+                if snapshots is None:
+                    try:
+                        snapshots = api.overlay_times()
+                    except Exception as e:
+                        snapshots = e
                 try:
                     if isinstance(snapshots, Exception):
                         raise snapshots
-                    self.alerts[i] = api.fetch_alerts(self.timed, self.layer.bbox, ts, snapshots)
+                    alerts[i] = api.fetch_alerts(timed, self.layer.bbox, ts, snapshots)
                 except Exception as e:
-                    self.alerts[i] = e
+                    alerts[i] = e
             try:
                 png = api.fetch_frame(
-                    self.layer, ts, *self.size, render.bgcolor(self.theme), self.overlays
+                    self.layer, ts, *self.size, render.bgcolor(self.theme), overlays
                 )
                 if markers is not None:
-                    self.plain[i] = sixel.encode(render.compose(png, legend, self.theme))
-                self.frames[i] = sixel.encode(render.compose(png, legend, self.theme, markers))
+                    plain[i] = sixel.encode(render.compose(png, legend, self.theme))
+                frames[i] = sixel.encode(render.compose(png, legend, self.theme, markers))
             except Exception as e:
-                self.plain[i] = self.frames[i] = e
+                plain[i] = frames[i] = e
 
     def _show(self, index: int) -> None:
         hidden = self.markers and not self.show_markers
@@ -198,6 +264,8 @@ class Slideshow:
         # below the image without touching it.
         self.term.write(f"{CSI}H{CSI}2J".encode() + body + f"{ESC}7".encode())
         self._status = ""
+        self._panel = []
+        self._shown_timed = self.timed
 
     def _draw_status(self, text: str) -> None:
         if text != self._status:
@@ -227,12 +295,14 @@ class Slideshow:
         if loaded < n:
             parts.append(f"[fetched {loaded}/{n}]")
         lines = ["  ".join(parts)[:cols]]
-        if self.timed:
-            lines += self._alert_lines(current, cols)
+        if side_panel(self.term.size(), self.size) is None:
+            lines.append(self._alert_line(current, cols))
         help_text = "space: play/pause  ←/→: step  "
         if self.timed:
             help_text += "m: messages  "
         help_text += f"l: {'stop looping' if self.loop else 'loop'}  "
+        for key, name in (("h", "hazards"), ("w", "warnings")):
+            help_text += f"{key}: {'hide' if name in self.overlays else 'show'} {name}  "
         if self.markers:
             help_text += f"t: {'hide' if self.show_markers else 'show'} markers  "
         if self.station_count > 1:
@@ -240,37 +310,92 @@ class Slideshow:
         lines.append((help_text + "q/esc: quit")[:cols])
         return "\r\n".join(lines)
 
-    def _alert_lines(self, index: int | None, cols: int) -> list[str]:
-        """Summary of a frame's alerts, one line per event type."""
+    def _alert_line(self, index: int | None, cols: int) -> str:
+        """The frame's most severe alert, with a count of any others."""
+        if not self.timed:
+            return "No warning or alert overlays."[:cols]
+        alerts = None if index is None else self.alerts[index]
+        if alerts is None:
+            return "alerts: loading..."
+        if isinstance(alerts, Exception):
+            return f"alerts: {alerts}"[:cols]
+        if not alerts:
+            return "no active alerts in view"
+        # Alerts come most severe first; the first event type is summarized.
+        event = alerts[0].event
+        group = [a for a in alerts if a.event == event]
+        text = event if len(group) == 1 else f"{event} \u00d7{len(group)}"
+        offices = sorted({a.wfo for a in group if a.wfo})
+        if offices:
+            text += f"  {', '.join(offices)}"
+        ends = [a.ends for a in group if a.ends]
+        if ends:
+            text += f"  until {max(ends):%a %H:%M} UTC"
+        others = len({a.event for a in alerts}) - 1
+        more = f"  (+{others} more, m: messages)" if others else ""
+        # Keep the count visible by shortening the summary instead.
+        text = text[: max(cols - len(more), 0)]
+        color = SIG_COLORS.get(alerts[0].sig)
+        return (f"{CSI}{color}m{text}{CSI}0m" if color else text) + more[: cols - len(text)]
+
+    def _panel_lines(self, index: int | None, width: int, height: int) -> list[str]:
+        """The frame's alerts by event type, most severe first, to fit the panel."""
         alerts = None if index is None else self.alerts[index]
         if alerts is None:
             return ["alerts: loading..."]
         if isinstance(alerts, Exception):
-            return [f"alerts: {alerts}"[:cols]]
+            return textwrap.wrap(f"alerts: {alerts}", width)[:height]
+        when = api.parse_time(self.times[index])
+        header = f"{CSI}1m{f'Alerts in view at {when:%H:%M} UTC'[:width]}{CSI}0m"
         if not alerts:
-            return ["no active alerts in view"]
+            return [header, "none"][:height]
         groups: dict[str, list[api.Alert]] = {}
         for alert in alerts:
             groups.setdefault(alert.event, []).append(alert)
-        lines = []
+        blocks = []
         for event, group in groups.items():
-            text = event if len(group) == 1 else f"{event} \u00d7{len(group)}"
+            title = (event if len(group) == 1 else f"{event} \u00d7{len(group)}")[:width]
+            color = SIG_COLORS.get(group[0].sig)
+            block = [f"{CSI}1;{color}m{title}{CSI}0m" if color else title]
             offices = sorted({a.wfo for a in group if a.wfo})
             if offices:
-                text += f"  {', '.join(offices)}"
+                block += textwrap.wrap(
+                    ", ".join(offices), width, initial_indent="  ", subsequent_indent="  "
+                )
             ends = [a.ends for a in group if a.ends]
             if ends:
-                text += f"  until {max(ends):%a %H:%M} UTC"
-            lines.append((group[0].sig, text))
-        if len(lines) > ALERT_LINES:
-            more = len(lines) - ALERT_LINES + 1
-            lines = lines[: ALERT_LINES - 1] + [("", f"... and {more} more (m: read messages)")]
-        out = []
-        for sig, text in lines:
-            color = SIG_COLORS.get(sig)
-            text = text[:cols]
-            out.append(f"{CSI}{color}m{text}{CSI}0m" if color else text)
-        return out
+                block.append(f"  until {max(ends):%a %H:%M} UTC"[:width])
+            blocks.append(block)
+        lines = [header]
+        for i, block in enumerate(blocks):
+            # Keep a line for the count of event types left out, if any.
+            room = height - len(lines) - (i < len(blocks) - 1)
+            if len(block) > room:
+                more = len(blocks) - i
+                lines.append(f"... and {more} more (m: messages)"[:width])
+                break
+            lines += block
+        return lines[:height]
+
+    def _draw_panel(self, index: int | None) -> None:
+        """Write the alert panel right of the map, if there is room for one.
+
+        Old lines are overwritten with concealed spaces rather than erased:
+        tmux drops a sixel image when an erase touches any of its rows.
+        """
+        panel = side_panel(self.term.size(), self.size)
+        if panel is None:
+            return
+        first, width, height = panel
+        lines = self._panel_lines(index, width, height) if self.timed else []
+        if lines == self._panel:
+            return
+        rows = len(lines) + max(len(self._panel) - len(lines), 0)
+        padded = lines + [""] * (rows - len(lines))
+        self._panel = lines
+        self.term.write(
+            "".join(f"{CSI}{y};{first}H{fill_line(line, width)}" for y, line in enumerate(padded, 1))
+        )
 
     def _open_messages(self, index: int) -> None:
         alerts = self.alerts[index]
@@ -370,9 +495,12 @@ class Slideshow:
             self._fetcher.start()
 
         current, target, playing = self._position
-        if current is None:
+        if current is None or self.frames[current] is None:
+            # A frame not loaded yet is drawn by the loop once it is.
             self.term.write(f"{CSI}H{CSI}2J{ESC}7")
             self._status = ""
+            self._panel = []
+            self._shown_timed = None
         else:
             self._show(current)
         next_due = time.monotonic() + self.delay
@@ -400,12 +528,22 @@ class Slideshow:
                 else:
                     playing = False
 
+            # After an h or w toggle, redraw once the current frame is loaded.
+            if (
+                current is not None
+                and target == current
+                and self._shown_timed != self.timed
+                and self.frames[current] is not None
+            ):
+                self._show(current)
+
             if target != current and self.frames[target] is not None:
                 self._show(target)
                 current = target
                 next_due = now + self.delay
 
             self._draw_status(self._status_text(current, target, playing))
+            self._draw_panel(current)
 
             key = self.term.read_key(0.1)
             if key in ("quit", "esc"):
@@ -419,9 +557,12 @@ class Slideshow:
                 self._open_messages(current)
             elif key == "loop":
                 self.loop = not self.loop
+            elif key in ("hazards", "warnings"):
+                self._toggle_overlay(key, current)
             elif key == "markers" and self.markers and current is not None:
                 self.show_markers = not self.show_markers
-                self._show(current)
+                if self.frames[current] is not None:
+                    self._show(current)
             elif key == "space":
                 if playing:
                     playing = False
@@ -484,7 +625,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="overlays: "
         + "; ".join(f"{k} = {o.description}" for k, o in api.OVERLAYS.items())
         + ". keys: space play/pause, left/right step, m read alert messages "
-        "(with hazards/warnings), l loop on/off, t show/hide markers, s next station "
+        "(with hazards/warnings), h/w show/hide hazards/warnings, l loop on/off, "
+        "t show/hide markers, s next station "
         "(with several -s), q or esc quit",
     )
     source = parser.add_mutually_exclusive_group()
@@ -651,22 +793,28 @@ def print_products(
             print(f"  {name:<{width}}{o.layer:<20} {timing:<29} {o.description}")
 
 
-def fit_size(
-    term: Terminal, layer: api.Layer, size: int, legend: bool, alerts: bool = False
-) -> tuple[int, int]:
+def fit_size(term: Terminal, layer: api.Layer, size: int, legend: bool) -> tuple[int, int]:
     """Map size from --size, shrunk if the terminal reports a smaller window."""
-    rows, _, xpix, ypix = term.size()
+    term_size = term.size()
+    rows, _, xpix, ypix = term_size
     box = min(size, xpix) if xpix else size
-    max_height = None
-    if ypix and rows:
-        cell_height = ypix / rows
-        # Leave room for the legend, the status lines and sixel band rounding.
-        lines = STATUS_LINES + (ALERT_LINES if alerts else 0)
-        reserved = (lines + 1) * cell_height + 6
-        if legend:
-            reserved += 30 + 2 * render.LEGEND_PAD
-        max_height = max(int(ypix - reserved), 32)
-    return render.map_size(layer.bbox, box, max_height)
+
+    def fit(lines: int) -> tuple[int, int]:
+        max_height = None
+        if ypix and rows:
+            cell_height = ypix / rows
+            # Leave room for the legend, the lines below and sixel band rounding.
+            reserved = (lines + 1) * cell_height + 6
+            if legend:
+                reserved += 30 + 2 * render.LEGEND_PAD
+            max_height = max(int(ypix - reserved), 32)
+        return render.map_size(layer.bbox, box, max_height)
+
+    map_size = fit(STATUS_LINES)
+    if side_panel(term_size, map_size) is None:
+        # No room beside the map: the alert summary goes under the status line.
+        map_size = fit(STATUS_LINES + 1)
+    return map_size
 
 
 def cycle_stations(shows: list[Slideshow]) -> None:
@@ -674,8 +822,11 @@ def cycle_stations(shows: list[Slideshow]) -> None:
     i = 0
     while shows[i].run() == "station":
         nxt = shows[(i + 1) % len(shows)]
-        # The l and t toggles carry over to the next station.
+        # The l, t, h and w toggles carry over to the next station.
         nxt.loop, nxt.show_markers = shows[i].loop, shows[i].show_markers
+        for name in ("hazards", "warnings"):
+            if (name in shows[i].overlays) != (name in nxt.overlays):
+                nxt._toggle_overlay(name, nxt._position[0])
         i = (i + 1) % len(shows)
 
 
@@ -729,10 +880,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise api.ApiError(
                     "this terminal does not report sixel support (use --force to try anyway)"
                 )
-            timed = any(api.OVERLAYS[o].timed for o in overlays)
             shows = []
             for i, (layer, times) in enumerate(shown):
-                size = fit_size(term, layer, args.size, not args.no_legend, timed)
+                size = fit_size(term, layer, args.size, not args.no_legend)
                 # Warnings go to the main screen, which is restored on exit.
                 markers = place_markers(
                     list(dict.fromkeys(args.marker)),

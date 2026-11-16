@@ -127,24 +127,32 @@ def test_failed_frame_is_shown_as_error(make_show, monkeypatch):
     assert isinstance(show.frames[1], api.ApiError)
 
 
-def test_alert_summary_groups_by_event(make_show):
-    show, shown = make_show([None] * 15, delay=0.001, overlays=("hazards",))
+def test_alert_summary_shows_most_severe(make_show):
+    show, _ = make_show([None] * 15, delay=0.001, overlays=("hazards",))
     show.run()
-    lines = show._alert_lines(0, 120)
-    assert "Tornado Warning  KFWS  until Sun 01:00 UTC" in lines[0]
-    assert lines[0].startswith(f"{cli.CSI}31m")
-    assert "Wind Advisory \u00d72  KFWS, KOUN  until Sun 01:00 UTC" in lines[1]
+    line = show._alert_line(0, 120)
+    assert line == (
+        f"{cli.CSI}31mTornado Warning  KFWS  until Sun 01:00 UTC{cli.CSI}0m"
+        "  (+1 more, m: messages)"
+    )
     assert "m: messages" in show._status_text(0, 0, False)
 
 
-def test_alert_summary_truncates(make_show, monkeypatch):
-    many = [api.Alert(f"Event {i}", "KFWS", "", f"u{i}", None) for i in range(6)]
-    monkeypatch.setattr(api, "fetch_alerts", lambda *a: many)
-    show, shown = make_show([None] * 15, delay=0.001, overlays=("warnings",))
+def test_alert_summary_groups_first_event(make_show, monkeypatch):
+    winds = [a for a in ALERTS if a.event == "Wind Advisory"]
+    monkeypatch.setattr(api, "fetch_alerts", lambda *a: winds)
+    show, _ = make_show([None] * 15, delay=0.001, overlays=("warnings",))
     show.run()
-    lines = show._alert_lines(0, 120)
-    assert len(lines) == cli.ALERT_LINES
-    assert lines[-1] == "... and 3 more (m: read messages)"
+    line = show._alert_line(0, 120)
+    assert "Wind Advisory \u00d72  KFWS, KOUN  until Sun 01:00 UTC" in line
+    assert "more" not in line
+
+
+def test_alert_summary_keeps_count_when_narrow(make_show):
+    show, _ = make_show([None] * 15, delay=0.001, overlays=("hazards",))
+    show.run()
+    plain = cli.SGR_RE.sub("", show._alert_line(0, 30))
+    assert plain == "Tornad  (+1 more, m: messages)"
 
 
 def test_no_alerts_without_timed_overlays(make_show, monkeypatch):
@@ -152,7 +160,9 @@ def test_no_alerts_without_timed_overlays(make_show, monkeypatch):
     show, shown = make_show([None] * 15, delay=0.001, overlays=("counties",))
     show.run()
     assert show.alerts == [None] * 3
-    assert "m: messages" not in show._status_text(0, 0, False)
+    status = show._status_text(0, 0, False)
+    assert "m: messages" not in status
+    assert status.split("\r\n")[1] == "No warning or alert overlays."
 
 
 def test_messages_view_pauses_and_returns(make_show):
@@ -227,16 +237,80 @@ def test_cycle_stations_wraps_and_carries_toggles():
         def __init__(self, name, results):
             self.name, self.results = name, results
             self.loop = self.show_markers = False
+            self.overlays = ("counties",)
+            self._position = (1, 1, False)
 
         def run(self):
-            order.append((self.name, self.loop, self.show_markers))
+            order.append((self.name, self.loop, self.show_markers, self.overlays))
             self.loop = self.show_markers = True
+            self.overlays = ("counties", "warnings")
             return self.results.pop(0)
+
+        def _toggle_overlay(self, name, current):
+            assert current == 1
+            self.overlays += (name,)
 
     order = []
     a, b = Show("a", ["station", "quit"]), Show("b", ["station"])
     cli.cycle_stations([a, b])
-    assert order == [("a", False, False), ("b", True, True), ("a", True, True)]
+    shown = ("counties", "warnings")
+    assert order == [
+        ("a", False, False, ("counties",)),
+        ("b", True, True, shown),
+        ("a", True, True, shown),
+    ]
+
+
+def test_h_and_w_toggle_overlays(make_show, monkeypatch):
+    fetched = []
+
+    def fetch(layer, ts, w, h, bg, overlays=()):
+        fetched.append((TIMES.index(ts), overlays))
+        return ts.encode() + b"".join(b"+" + o.encode() for o in overlays)
+
+    monkeypatch.setattr(api, "fetch_frame", fetch)
+    alerts_for = []
+    monkeypatch.setattr(
+        api, "fetch_alerts", lambda overlays, *a: alerts_for.append(overlays) or ALERTS
+    )
+    keys = [None, "space", "right", "hazards", None, "warnings", None, "hazards", None]
+    show, shown = make_show(keys, delay=100, overlays=("counties",))
+    assert "h: show hazards  w: show warnings" in show._status_text(0, 0, False)
+    show.run()
+    assert shown == [0, 1, 1, 1, 1]
+    # Each new combination is fetched starting from the frame on screen.
+    assert fetched == [
+        (0, ("counties",)),
+        (1, ("counties",)),
+        (2, ("counties",)),
+        (1, ("counties", "hazards")),
+        (2, ("counties", "hazards")),
+        (0, ("counties", "hazards")),
+        (1, ("counties", "hazards", "warnings")),
+        (2, ("counties", "hazards", "warnings")),
+        (0, ("counties", "hazards", "warnings")),
+        (1, ("counties", "warnings")),
+        (2, ("counties", "warnings")),
+        (0, ("counties", "warnings")),
+    ]
+    assert alerts_for == [("hazards",)] * 3 + [("hazards", "warnings")] * 3 + [("warnings",)] * 3
+    images = [s for s in show.term.screens if isinstance(s, bytes) and b"2026" in s]
+    assert [i.count(b"+") for i in images] == [1, 1, 2, 3, 2]
+    assert "h: show hazards  w: hide warnings" in show._status_text(1, 1, False)
+    assert "Tornado Warning" in show._status_text(1, 1, False)
+
+
+def test_toggling_back_uses_cached_frames(make_show, monkeypatch):
+    fetched = []
+    monkeypatch.setattr(
+        api, "fetch_frame", lambda layer, ts, w, h, bg, overlays=(): fetched.append(ts) or b"x"
+    )
+    show, shown = make_show([None, "space", "warnings", None, "warnings", None], delay=100)
+    show.run()
+    assert len(fetched) == 6
+    assert shown == [0, 0, 0]
+    assert show.timed == ()
+    assert "m: messages" not in show._status_text(0, 0, False)
 
 
 def test_fill_line():
@@ -261,3 +335,84 @@ def test_exit_blanks_every_cell(monkeypatch):
     ]
     t.leave_alt_screen()
     assert len(out) == 3
+
+
+def test_side_panel_geometry():
+    # 10x20 pixel cells; an 800x600 map spans 80 columns and 30 rows.
+    assert cli.side_panel((40, 200, 2000, 800), (800, 600)) == (83, 117, 30)
+    assert cli.side_panel((40, 200, 0, 0), (800, 600)) is None
+    assert cli.side_panel((40, 100, 1000, 800), (800, 600)) is None
+
+
+def panel_writes(show):
+    return [s for s in show.term.screens if isinstance(s, str) and f"{cli.CSI}1;83H" in s]
+
+
+def test_alerts_go_beside_the_map(make_show):
+    keys = [None, "space", "warnings", None]
+    show, _ = make_show(keys, delay=100, overlays=("hazards",))
+    show.size = (800, 600)
+    show.term.size = lambda: (40, 200, 2000, 800)
+    show.run()
+    status = show._status_text(0, 0, False)
+    assert "Tornado Warning" not in status and "No warning" not in status
+    assert len(status.split("\r\n")) == cli.STATUS_LINES
+    lines = show._panel_lines(0, 117, 30)
+    assert cli.SGR_RE.sub("", lines[0]) == "Alerts in view at 00:00 UTC"
+    assert [cli.SGR_RE.sub("", line) for line in lines[1:]] == [
+        "Tornado Warning",
+        "  KFWS",
+        "  until Sun 01:00 UTC",
+        "Wind Advisory ×2",
+        "  KFWS, KOUN",
+        "  until Sun 01:00 UTC",
+    ]
+    assert lines[1].startswith(f"{cli.CSI}1;31m")
+    writes = panel_writes(show)
+    assert "Tornado Warning" in writes[0]
+    # Every panel row is overwritten to the panel width, never erased.
+    for write in writes:
+        assert f"{cli.CSI}K" not in write and f"{cli.CSI}J" not in write
+        rows = re.split(r"\x1b\[\d+;83H", write)[1:]
+        assert all(len(cli.SGR_RE.sub("", r)) == 117 for r in rows)
+
+
+def test_panel_blanked_when_overlays_turned_off(make_show):
+    show, _ = make_show([None], delay=100, overlays=("hazards",))
+    show.size = (800, 600)
+    show.term.size = lambda: (40, 200, 2000, 800)
+    show.run()
+    assert len(show._panel) == 7
+    # Turned off while the frame on screen still shows the overlays.
+    show.overlays = ()
+    show._select()
+    show._draw_panel(0)
+    assert show._panel == []
+    blank = f"{cli.CSI}0;8m{' ' * 117}{cli.CSI}0m"
+    assert show.term.screens[-1] == "".join(f"{cli.CSI}{y};83H{blank}" for y in range(1, 8))
+
+
+def test_panel_counts_event_types_left_out(make_show, monkeypatch):
+    many = [api.Alert(f"Event {i}", "KFWS", "", f"u{i}", None) for i in range(6)]
+    monkeypatch.setattr(api, "fetch_alerts", lambda *a: many)
+    show, _ = make_show([None] * 15, delay=0.001, overlays=("warnings",))
+    show.run()
+    lines = show._panel_lines(0, 40, 6)
+    assert len(lines) == 6
+    assert lines[-1] == "... and 4 more (m: messages)"
+    assert len(show._panel_lines(0, 40, 13)) == 13
+
+
+def test_fit_size_reserves_alert_line_only_without_panel(monkeypatch):
+    monkeypatch.setattr(cli.render, "map_size", lambda bbox, box, max_height: (box, max_height))
+    layer = api.Layer("kabx", "sr_bref", "", "", (0, 0, 1, 1), ())
+
+    class Term:
+        def __init__(self, size):
+            self.size = lambda: size
+
+    wide = cli.fit_size(Term((40, 200, 2000, 800)), layer, 800, legend=False)
+    narrow = cli.fit_size(Term((40, 100, 1000, 800)), layer, 800, legend=False)
+    # 20 pixel rows: status and help (plus one spare) vs. the extra alert line.
+    assert wide == (800, 800 - 3 * 20 - 6)
+    assert narrow == (800, 800 - 4 * 20 - 6)

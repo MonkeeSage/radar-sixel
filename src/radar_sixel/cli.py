@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import re
 import sys
@@ -11,8 +13,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import __version__, api, render, sixel
+from .cache import DEFAULT_LIMIT_MB, Cache, default_dir
 from .term import CSI, ESC, Terminal
 
 PROG = "radar-sixel"
@@ -205,11 +209,53 @@ class Slideshow:
                 return self.overlays, self.timed, (self.frames, self.plain, self.alerts), i
         return None
 
+    def _render_key(
+        self, ts: str, overlays: tuple[str, ...], tag: str | None, legend: str | None, markers: bool
+    ) -> str | None:
+        """Cache key for an encoded frame; None if it can't be cached yet.
+
+        tag is the overlay snapshots (see api.snapshot_tag), legend a digest
+        of the legend image.
+        """
+        if tag is None:
+            return None
+        # Everything the encoded image depends on; the version covers changes
+        # to how frames are drawn and encoded.
+        spec: list = [
+            "sixel",
+            __version__,
+            self.layer.qualified_name,
+            self.layer.bbox,
+            ts,
+            self.size,
+            self.theme,
+            overlays,
+            tag,
+            legend,
+        ]
+        if markers:
+            spec += [self.markers, self.marker_color, self.marker_opacity, self.marker_size]
+        return json.dumps(spec)
+
+    @staticmethod
+    def _load(key: str | None) -> bytes | None:
+        entry = api.cache.get(key) if key else None
+        return entry.data if entry else None
+
+    @staticmethod
+    def _encode(key: str | None, image) -> bytes:
+        data = sixel.encode(image)
+        if key:
+            api.cache.put(key, data)
+        return data
+
     def _fetch_all(self) -> None:
-        legend = None
+        legend = legend_id = None
         if self.legend:
             try:
-                legend = render.load_legend(api.fetch_legend(self.layer))
+                png = api.fetch_legend(self.layer)
+                legend = render.load_legend(png)
+                legend_id = hashlib.sha256(png).hexdigest()
             except Exception:
                 pass  # The legend is optional; frames still render without it.
         markers = None
@@ -242,13 +288,32 @@ class Slideshow:
                     alerts[i] = api.fetch_alerts(timed, self.layer.bbox, ts, snapshots)
                 except Exception as e:
                     alerts[i] = e
+            known = snapshots if isinstance(snapshots, dict) else None
+            tag = api.snapshot_tag(overlays, ts, known)
             try:
-                png = api.fetch_frame(
-                    self.layer, ts, *self.size, render.bgcolor(self.theme), overlays
-                )
+                # Without markers, plain and frames are the same image.
+                key = self._render_key(ts, overlays, tag, legend_id, markers is not None)
+                plain_key = self._render_key(ts, overlays, tag, legend_id, False)
+                frame = self._load(key)
+                bare = self._load(plain_key) if markers is not None else frame
+                if frame is None or bare is None:
+                    png = api.fetch_frame(
+                        self.layer,
+                        ts,
+                        *self.size,
+                        render.bgcolor(self.theme),
+                        overlays,
+                        snapshots=known,
+                    )
+                    if markers is not None and bare is None:
+                        bare = self._encode(plain_key, render.compose(png, legend, self.theme))
+                    if frame is None:
+                        frame = self._encode(
+                            key, render.compose(png, legend, self.theme, markers)
+                        )
                 if markers is not None:
-                    plain[i] = sixel.encode(render.compose(png, legend, self.theme))
-                frames[i] = sixel.encode(render.compose(png, legend, self.theme, markers))
+                    plain[i] = bare
+                frames[i] = frame
             except Exception as e:
                 plain[i] = frames[i] = e
 
@@ -587,6 +652,13 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _non_negative_int(value: str) -> int:
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return n
+
+
 def _positive_float(value: str) -> float:
     n = float(value)
     if n <= 0:
@@ -735,6 +807,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-legend", action="store_true", help="do not draw the color legend"
     )
     parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        metavar="DIR",
+        help="where to keep fetched layers and rendered frames (default: "
+        "$XDG_CACHE_HOME/radar-sixel, or ~/.cache/radar-sixel)",
+    )
+    parser.add_argument(
+        "--cache-size",
+        type=_non_negative_int,
+        default=DEFAULT_LIMIT_MB,
+        metavar="MB",
+        help="cache size limit; the oldest files are deleted past it, and 0 "
+        "turns the cache off (default: %(default)s)",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="skip the terminal sixel support check",
@@ -833,6 +920,7 @@ def cycle_stations(shows: list[Slideshow]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    api.cache = Cache(args.cache_dir or default_dir(), args.cache_size * 1024 * 1024)
 
     try:
         if args.list is not None:

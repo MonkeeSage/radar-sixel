@@ -90,7 +90,7 @@ def test_default_product_for_region():
 
 def test_fetch_frame_draw_order(monkeypatch):
     calls = []
-    monkeypatch.setattr(api, "_get_image", lambda url, params: calls.append(params) or b"")
+    monkeypatch.setattr(api, "_get_image", lambda url, params, **k: calls.append(params) or b"")
     layer = api.Layer("kabx", "sr_bref", "", "", (-111.8, 30.1, -101.8, 40.1), ())
     api.fetch_frame(layer, "T", 10, 10, "0x000000", ("warnings", "counties", "hazards"))
 
@@ -109,7 +109,7 @@ def test_fetch_frame_draw_order(monkeypatch):
 
 def test_fetch_frame_without_overlays(monkeypatch):
     calls = []
-    monkeypatch.setattr(api, "_get_image", lambda url, params: calls.append(params) or b"")
+    monkeypatch.setattr(api, "_get_image", lambda url, params, **k: calls.append(params) or b"")
     layer = api.Layer("conus", "cref_qcd", "", "", (-130, 20, -60, 55), ())
     api.fetch_frame(layer, "T", 10, 10, "0x000000")
     assert calls[0]["layers"] == "conus:conus_cref_qcd,geopolitical"
@@ -144,7 +144,7 @@ def test_fetch_alerts_dedupes_and_sorts(monkeypatch):
     }
     calls = []
 
-    def get(url, params):
+    def get(url, params, **k):
         calls.append(params)
         return api.json.dumps({"features": responses[params["typeName"]]}).encode()
 

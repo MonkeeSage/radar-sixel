@@ -85,6 +85,9 @@ Options:
   if the terminal reports a smaller window)
 - `--theme dark|light` – map background
 - `--no-legend` – omit the color legend
+- `--cache-dir DIR` – where to cache (default `$XDG_CACHE_HOME/radar-sixel`,
+  or `~/.cache/radar-sixel`); see below
+- `--cache-size MB` – cache size limit (default 250); 0 turns the cache off
 - `--force` – skip the terminal sixel support check
 
 Overlays (state and country borders are always drawn):
@@ -117,3 +120,23 @@ the full messages (headline, areas, description and instructions) from
 [api.weather.gov](https://www.weather.gov/documentation/services-web-api);
 scroll with the arrow keys, PgUp/PgDn, Home/End or j/k, and press `m` or esc
 to return to the map.
+
+## Cache
+
+To go easy on the weather service, fetched imagery and alerts are cached on
+disk, along with the frames as drawn for the terminal, so replaying a loop or
+starting again later only fetches the captures that are new since.
+
+A capture never changes once published, so frames are identified by their
+capture time and kept until evicted; the same goes for each `hazards` and
+`warnings` snapshot and for the full alert messages. A frame with those
+overlays is identified by the snapshots it was drawn with too, and isn't
+cached while a newer snapshot could still replace them (until there's one at
+or after the capture time). The lists of captures and snapshots are reused
+only as long as the server allows (15 seconds); the station list and legends
+for a day. Where the server sends `ETag` or `Last-Modified` (currently only
+the station index page), a stale copy is revalidated rather than downloaded
+again.
+
+When the cache grows past `--cache-size`, the oldest files are deleted first.
+Each file is one entry, so it is safe to delete the directory at any time.

@@ -7,17 +7,23 @@ import json
 import math
 import re
 import threading
+import time as _time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import __version__
+from .cache import Cache
 
 BASE_URL = "https://opengeo.ncep.noaa.gov/geoserver"
 INDEX_URL = f"{BASE_URL}/www/index.html"
 USER_AGENT = f"radar-sixel/{__version__}"
 TIMEOUT = 30
+# How long the station list and legends are reused before asking again; the
+# server sends no caching headers for them.
+DAY = 24 * 3600
 
 # Base reflectivity: NEXRAD stations, then MRMS regional mosaics.
 DEFAULT_PRODUCTS = ("sr_bref", "bref_qcd")
@@ -126,6 +132,9 @@ _SHORT_FUSE = (
 _VTEC_END_RE = re.compile(r"-(\d{6}T\d{4})Z/")
 
 
+# Responses worth keeping; the CLI points this at the user's cache directory.
+cache = Cache(None)
+
 _conns: dict[str, http.client.HTTPSConnection] = {}
 _host_locks: dict[str, threading.Lock] = {}
 _locks_lock = threading.Lock()
@@ -145,12 +154,66 @@ def _host_lock(host: str) -> threading.Lock:
         return _host_locks.setdefault(host, threading.Lock())
 
 
-def _get(url: str, params: dict[str, str] | None = None) -> bytes:
+def _get(
+    url: str,
+    params: dict[str, str] | None = None,
+    *,
+    ttl: float | None = None,
+    tag: str = "",
+    check: Callable[[bytes], None] | None = None,
+) -> bytes:
+    """GET a URL, through the cache when ttl is given.
+
+    ttl is how many seconds a cached copy is used without asking the server,
+    unless the server says otherwise with Cache-Control; math.inf means the
+    content never changes, whatever the server says. A stale copy is
+    revalidated with its ETag or Last-Modified when it has one. tag is added
+    to the cache key, for what the response depends on beyond the URL. check
+    raises ApiError for a response that must not be kept.
+    """
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
+    key = f"{url} {tag}" if tag else url
+    entry = cache.get(key) if ttl is not None else None
+    if entry is not None and _time.time() < entry.fresh_until:
+        return entry.data
+    headers = {"User-Agent": USER_AGENT}
+    if entry is not None:
+        if entry.etag:
+            headers["If-None-Match"] = entry.etag
+        if entry.last_modified:
+            headers["If-Modified-Since"] = entry.last_modified
+    resp, data = _request(url, headers)
+    if resp.status == 304 and entry is not None:
+        data = entry.data
+    elif resp.status != 200:
+        raise ApiError(f"HTTP {resp.status} fetching {url}")
+    elif check is not None:
+        check(data)
+    if ttl is not None:
+        cache.put(
+            key,
+            data,
+            _fresh_until(resp, ttl),
+            resp.getheader("ETag") or (entry.etag if entry else ""),
+            resp.getheader("Last-Modified") or (entry.last_modified if entry else ""),
+        )
+    return data
+
+
+def _fresh_until(resp: http.client.HTTPResponse, ttl: float) -> float:
+    if math.isinf(ttl):
+        return ttl
+    control = (resp.getheader("Cache-Control") or "").lower()
+    if "no-store" in control or "no-cache" in control:
+        return 0.0
+    m = re.search(r"max-age=(\d+)", control)
+    return _time.time() + (int(m.group(1)) if m else ttl)
+
+
+def _request(url: str, headers: dict[str, str]) -> tuple[http.client.HTTPResponse, bytes]:
     parts = urllib.parse.urlsplit(url)
     path = f"{parts.path}?{parts.query}" if parts.query else parts.path
-    headers = {"User-Agent": USER_AGENT}
     # One request at a time per connection; other hosts are not blocked.
     with _host_lock(parts.netloc):
         for attempt in range(2):
@@ -168,17 +231,24 @@ def _get(url: str, params: dict[str, str] | None = None) -> bytes:
             except (http.client.HTTPException, OSError) as e:
                 _connection(parts.netloc, fresh=True)
                 raise ApiError(f"could not fetch {url}: {e}") from e
-    if resp.status != 200:
-        raise ApiError(f"HTTP {resp.status} fetching {url}")
-    return data
+    return resp, data
 
 
-def _get_image(url: str, params: dict[str, str]) -> bytes:
-    data = _get(url, params)
+def _check_png(data: bytes) -> None:
     # GeoServer reports errors as XML with a 200 status.
     if not data.startswith(b"\x89PNG"):
         raise ApiError(f"server returned an error: {_service_exception(data)}")
-    return data
+
+
+def _check_features(data: bytes) -> None:
+    try:
+        json.loads(data)["features"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise ApiError(f"server returned an error: {_service_exception(data)}") from e
+
+
+def _get_image(url: str, params: dict[str, str], ttl: float | None = None, tag: str = "") -> bytes:
+    return _get(url, params, ttl=ttl, tag=tag, check=_check_png)
 
 
 def _service_exception(data: bytes) -> str:
@@ -189,7 +259,7 @@ def _service_exception(data: bytes) -> str:
 
 def list_stations() -> list[Station]:
     """Return the radar stations that have imagery, sorted by ID."""
-    index = _get(INDEX_URL).decode("utf-8", "replace")
+    index = _get(INDEX_URL, ttl=DAY).decode("utf-8", "replace")
     workspaces = set(_WORKSPACE_RE.findall(index))
 
     sites = json.loads(
@@ -202,6 +272,8 @@ def list_stations() -> list[Station]:
                 "typeName": "nws:radar_sites",
                 "outputFormat": "application/json",
             },
+            ttl=DAY,
+            check=_check_features,
         )
     )
     by_id: dict[str, Station] = {}
@@ -232,6 +304,9 @@ def workspace_layers(workspace: str) -> dict[str, Layer]:
         data = _get(
             f"{BASE_URL}/{workspace}/ows",
             {"service": "WMS", "version": "1.3.0", "request": "GetCapabilities"},
+            # New captures appear every few minutes, so this is kept only as
+            # long as the server says (15 seconds).
+            ttl=0,
         )
     except ApiError as e:
         if "HTTP 404" in str(e):
@@ -331,12 +406,16 @@ def fetch_frame(
     height: int,
     bgcolor: str,
     overlays: tuple[str, ...] = (),
+    snapshots: dict[str, tuple[str, ...]] | None = None,
 ) -> bytes:
     """Fetch one PNG capture with borders and overlays drawn in z order.
 
     The single time parameter applies to every time-enabled layer, and the
-    server snaps each one to its nearest snapshot.
+    server snaps each one to its nearest snapshot. A capture never changes,
+    so it is cached for good, along with the snapshots it was drawn with
+    (see snapshot_tag); without snapshots, timed overlays are not cached.
     """
+    tag = snapshot_tag(overlays, time, snapshots)
     stack = [(_RADAR, layer.qualified_name, ""), (_BORDERS, "geopolitical", "")]
     stack += [(OVERLAYS[o].z, OVERLAYS[o].layer, OVERLAYS[o].style) for o in overlays]
     stack.sort(key=lambda entry: entry[0])
@@ -356,6 +435,8 @@ def fetch_frame(
             "bgcolor": bgcolor,
             "time": time,
         },
+        ttl=None if tag is None else math.inf,
+        tag=tag or "",
     )
 
 
@@ -371,6 +452,7 @@ def fetch_legend(layer: Layer) -> bytes:
             "height": "30",
             "layer": layer.qualified_name,
         },
+        ttl=DAY,
     )
 
 
@@ -379,6 +461,7 @@ def overlay_times() -> dict[str, tuple[str, ...]]:
     data = _get(
         f"{BASE_URL}/wwa/ows",
         {"service": "WMS", "version": "1.3.0", "request": "GetCapabilities"},
+        ttl=0,
     )
     try:
         root = ET.fromstring(data)
@@ -403,6 +486,26 @@ def nearest_time(times: tuple[str, ...], time: str) -> str | None:
         return None
     when = parse_time(time)
     return min(times, key=lambda t: abs(parse_time(t) - when))
+
+
+def snapshot_tag(
+    overlays: tuple[str, ...], time: str, snapshots: dict[str, tuple[str, ...]] | None
+) -> str | None:
+    """The WWA snapshots a frame at time is drawn with, e.g. "warnings=...".
+
+    "" without timed overlays. None if the snapshots are unknown, or a newer
+    snapshot could still come along that is nearer to time: until there is
+    one at or after time, the server's pick (and so the image) can change.
+    """
+    tags = []
+    for name in overlays:
+        if not OVERLAYS[name].timed:
+            continue
+        times = (snapshots or {}).get(name, ())
+        if not times or parse_time(times[-1]) < parse_time(time):
+            return None
+        tags.append(f"{name}={nearest_time(times, time)}")
+    return " ".join(tags)
 
 
 def fetch_alerts(
@@ -438,11 +541,11 @@ def fetch_alerts(
                     f"BBOX(geom,{x0:.3f},{y0:.3f},{x1:.3f},{y1:.3f},'EPSG:3857')"
                 ),
             },
+            # A snapshot never changes once published.
+            ttl=math.inf,
+            check=_check_features,
         )
-        try:
-            features = json.loads(data)["features"]
-        except (ValueError, KeyError) as e:
-            raise ApiError(f"server returned an error: {_service_exception(data)}") from e
+        features = json.loads(data)["features"]
         for feature in features:
             alert = _parse_alert(feature.get("properties") or {})
             if alert:
@@ -479,10 +582,15 @@ def fetch_alert_text(alert: Alert) -> AlertText:
     """The full message for an alert from api.weather.gov."""
     if not alert.url.startswith(ALERT_URL_PREFIX):
         raise ApiError(f"unexpected alert URL {alert.url!r}")
-    try:
-        props = json.loads(_get(alert.url))["properties"]
-    except (ValueError, KeyError) as e:
-        raise ApiError(f"could not parse alert {alert.url}") from e
+
+    def check(data: bytes) -> None:
+        try:
+            json.loads(data)["properties"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise ApiError(f"could not parse alert {alert.url}") from e
+
+    # Updates to an alert are new messages with their own URLs.
+    props = json.loads(_get(alert.url, ttl=math.inf, check=check))["properties"]
     return AlertText(
         event=props.get("event") or alert.event,
         headline=props.get("headline") or "",

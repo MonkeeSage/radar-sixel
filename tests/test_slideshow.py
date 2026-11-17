@@ -47,7 +47,7 @@ class FakeTerm:
 @pytest.fixture
 def make_show(monkeypatch):
     monkeypatch.setattr(api, "fetch_legend", lambda layer: b"")
-    monkeypatch.setattr(api, "fetch_frame", lambda layer, ts, w, h, bg, overlays=(): ts.encode())
+    monkeypatch.setattr(api, "fetch_frame", lambda layer, ts, w, h, bg, overlays=(), snapshots=None: ts.encode())
     monkeypatch.setattr(cli.render, "load_legend", lambda data: None)
     monkeypatch.setattr(
         cli.render, "compose", lambda png, legend, theme, markers=None: png + (markers or b"")
@@ -114,8 +114,49 @@ def test_space_pauses_playback(make_show):
     assert shown == [0, 1]
 
 
+def test_rendered_frames_are_cached(make_show, monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "cache", cli.Cache(tmp_path))
+    fetched = []
+
+    def fetch(layer, ts, w, h, bg, overlays=(), snapshots=None):
+        fetched.append(ts)
+        return ts.encode()
+
+    monkeypatch.setattr(api, "fetch_frame", fetch)
+    first, _ = make_show([None] * 15, delay=0.001, markers=[(1, 2, "Home")])
+    first.run()
+    assert len(fetched) == 3
+    second, _ = make_show([None] * 15, delay=0.001, markers=[(1, 2, "Home")])
+    second.run()
+    assert len(fetched) == 3
+    assert second.frames == first.frames
+    assert second.plain == first.plain
+    # Different markers: the frames without them are still cached, but the
+    # marked ones are drawn again.
+    third, _ = make_show([None] * 15, delay=0.001, markers=[(3, 4, "Work")])
+    third.run()
+    assert len(fetched) == 6
+
+
+def test_frames_with_unsettled_overlays_are_drawn_again(make_show, monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "cache", cli.Cache(tmp_path))
+    # Only the first frame has a warnings snapshot at or after it.
+    monkeypatch.setattr(api, "overlay_times", lambda: {"warnings": (TIMES[0],)})
+    fetched = []
+
+    def fetch(layer, ts, w, h, bg, overlays=(), snapshots=None):
+        fetched.append(ts)
+        return ts.encode()
+
+    monkeypatch.setattr(api, "fetch_frame", fetch)
+    for _ in range(2):
+        show, _ = make_show([None] * 15, delay=0.001, overlays=("warnings",))
+        show.run()
+    assert fetched == TIMES + TIMES[1:]
+
+
 def test_failed_frame_is_shown_as_error(make_show, monkeypatch):
-    def fetch(layer, ts, w, h, bg, overlays=()):
+    def fetch(layer, ts, w, h, bg, overlays=(), snapshots=None):
         if ts == TIMES[1]:
             raise api.ApiError("boom")
         return ts.encode()
@@ -264,7 +305,7 @@ def test_cycle_stations_wraps_and_carries_toggles():
 def test_h_and_w_toggle_overlays(make_show, monkeypatch):
     fetched = []
 
-    def fetch(layer, ts, w, h, bg, overlays=()):
+    def fetch(layer, ts, w, h, bg, overlays=(), snapshots=None):
         fetched.append((TIMES.index(ts), overlays))
         return ts.encode() + b"".join(b"+" + o.encode() for o in overlays)
 
@@ -303,7 +344,7 @@ def test_h_and_w_toggle_overlays(make_show, monkeypatch):
 def test_toggling_back_uses_cached_frames(make_show, monkeypatch):
     fetched = []
     monkeypatch.setattr(
-        api, "fetch_frame", lambda layer, ts, w, h, bg, overlays=(): fetched.append(ts) or b"x"
+        api, "fetch_frame", lambda layer, ts, w, h, bg, overlays=(), snapshots=None: fetched.append(ts) or b"x"
     )
     show, shown = make_show([None, "space", "warnings", None, "warnings", None], delay=100)
     show.run()
